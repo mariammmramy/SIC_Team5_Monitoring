@@ -1,216 +1,184 @@
 #!/usr/bin/env python3
 """
-Smart Public Area Monitoring - Raspberry Pi 4
-Sensors: Sound sensor (digital), IR sensor, Smoke sensor, DHT11
-Actions: Buzzer, LEDs, Camera (rpicam-still + face detection)
-Platform: Blynk (IoT integration)
+Smart Public Area Safety Node - Raspberry Pi 4
+Sensors: Mic (digital), IR sensor (digital), Smoke sensor (digital), DHT11
+Actions: LEDs, Buzzer, Camera capture
+Connection: Blynk + Secure MQTT (HiveMQ Cloud)
 """
 
 import time
+import threading
 import json
 import os
 import subprocess
 from datetime import datetime
-import threading
+import ssl
 
-import cv2
+import blynklib
+import paho.mqtt.client as mqtt
+from gpiozero import LED, Buzzer, DigitalInputDevice
 import board
 import adafruit_dht
-from gpiozero import LED, Buzzer, DigitalInputDevice
-from blynklib import Blynk
 
-# ------------------ Config ------------------
-BLYNK_AUTH_TOKEN = "YOUR_BLYNK_AUTH_TOKEN"
+# ----------------- Config -----------------
+BLYNK_AUTH_TOKEN = "yI2np_RtdvbitTInHN0DQa120quz1JT4"
 
-# Pins
-PIN_SOUND = 18
+# --- HiveMQ Cloud secure MQTT settings ---
+MQTT_BROKER = "1b14277679694b60aa7438f6116823b6.s1.eu.hivemq.cloud"
+MQTT_PORT = 8883
+MQTT_TOPIC = "team5/public_area"
+MQTT_USERNAME = "Nada131"
+MQTT_PASSWORD = "Sic1122004"
+
+CAMERA_ENABLED = True
+TEMP_THRESHOLD = 60.0
+
+# GPIO pins
+PIN_DHT11 = board.D4
 PIN_IR = 17
-PIN_SMOKE = 22
+PIN_SMOKE = 16
+PIN_SOUND = 20
 PIN_BUZZER = 27
 PIN_LED_GREEN = 5
 PIN_LED_YELLOW = 6
 PIN_LED_RED = 13
-PIN_DHT11 = board.D4
 
-# Camera
-CAPTURE_DIR = "captures"
-os.makedirs(CAPTURE_DIR, exist_ok=True)
-
-# ------------------ GPIO Setup ------------------
-sound_sensor = DigitalInputDevice(PIN_SOUND, pull_up=False)
-ir_sensor = DigitalInputDevice(PIN_IR, pull_up=False)
-smoke_sensor = DigitalInputDevice(PIN_SMOKE, pull_up=False)
-
+# ----------------- GPIO Setup -----------------
 buzzer = Buzzer(PIN_BUZZER)
 led_green = LED(PIN_LED_GREEN)
 led_yellow = LED(PIN_LED_YELLOW)
 led_red = LED(PIN_LED_RED)
+ir_sensor = DigitalInputDevice(PIN_IR, pull_up=False)
+smoke_sensor = DigitalInputDevice(PIN_SMOKE, pull_up=False)
+sound_sensor = DigitalInputDevice(PIN_SOUND, pull_up=False)
 
 dht_device = adafruit_dht.DHT11(PIN_DHT11)
-
-# Face detection model
-face_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-)
-
-# ------------------ Blynk Setup ------------------
-blynk = Blynk(BLYNK_AUTH_TOKEN)
-
-def publish_to_blynk(data: dict):
-    """Send key-value telemetry to Blynk virtual pins"""
-    for key, value in data.items():
-        try:
-            if key == "temperature":
-                blynk.virtual_write(1, value)  # V1 = temperature
-            elif key == "humidity":
-                blynk.virtual_write(2, value)  # V2 = humidity
-            elif key == "smoke":
-                blynk.virtual_write(3, value)  # V3 = smoke
-            elif key == "event":
-                blynk.virtual_write(4, value)  # V4 = events log
-        except Exception as e:
-            print("[BLYNK ERROR]", e)
-
-# ------------------ Helpers ------------------
-def timestamp_utc():
-    return datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-
-def capture_image_with_face(tag="event"):
-    ts = timestamp_utc()
-    filename = f"{CAPTURE_DIR}/{tag}_{ts}.jpg"
-
-    # Capture with rpicam-still
-    cmd = [
-        "rpicam-still",
-        "-o", filename,
-        "--width", "1280",
-        "--height", "720",
-        "--timeout", "1000",
-        "--nopreview"
-    ]
-    try:
-        subprocess.run(cmd, check=True)
-        print(f"[INFO] Photo captured: {filename}")
-    except subprocess.CalledProcessError as e:
-        print("[ERROR] Failed to capture photo:", e)
-        return filename, False
-
-    # Face detection
-    img = cv2.imread(filename)
-    if img is None:
-        return filename, False
-
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray, 1.1, 4)
-    has_face = len(faces) > 0
-
-    return filename, has_face
-
-def beep(pattern="short"):
-    if pattern == "short":
-        buzzer.on(); time.sleep(0.2); buzzer.off()
-    elif pattern == "long":
-        buzzer.on(); time.sleep(1); buzzer.off()
 
 def led_set(green=False, yellow=False, red=False):
     led_green.value = 1 if green else 0
     led_yellow.value = 1 if yellow else 0
     led_red.value = 1 if red else 0
 
-# ------------------ Event Handlers ------------------
-def handle_sound_event():
-    led_set(red=True)
-    beep("short")
-    photo, has_face = capture_image_with_face("noise")
-    event = {
-        "event": "sound_detected",
-        "face_detected": has_face,
-        "photo": photo
-    }
-    publish_to_blynk(event)
-    print("[EVENT] Sound detected:", event)
-    time.sleep(2)
-    led_set(green=True)
+# ----------------- Blynk Setup -----------------
+blynk = blynklib.Blynk(BLYNK_AUTH_TOKEN)
 
-def handle_motion_event():
+def publish_to_blynk(event: dict):
+    print("[BLYNK]", event)
+    if event["type"] == "smoke":
+        blynk.notify("Smoke detected in monitored area!")
+    elif event["type"] == "noise":
+        blynk.notify("Loud noise detected!")
+    elif event["type"] == "high_temp":
+        blynk.notify("High temperature detected!")
+
+# ----------------- MQTT Setup -----------------
+client = mqtt.Client()
+client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+client.tls_set(tls_version=ssl.PROTOCOL_TLS)  # enable TLS/SSL
+client.connect(MQTT_BROKER, MQTT_PORT, 60)
+client.loop_start()
+
+def publish_mqtt(data: dict):
+    try:
+        payload = json.dumps(data)
+        client.publish(MQTT_TOPIC, payload)
+        print("[MQTT] Published:", payload)
+    except Exception as e:
+        print("[MQTT ERROR]", e)
+
+# ----------------- Camera -----------------
+def capture_image(tag="event"):
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    os.makedirs("captures", exist_ok=True)
+    filename = f"captures/{tag}_{ts}.jpg"
+    cmd = ["rpicam-still", "-o", filename, "--width", "640", "--height", "480", "--timeout", "1000", "--nopreview"]
+    try:
+        subprocess.run(cmd, check=True)
+        print("[CAMERA] Photo saved:", filename)
+    except subprocess.CalledProcessError as e:
+        print("[CAMERA ERROR]", e)
+    return filename
+
+# ----------------- Event Handling -----------------
+def beep(pattern="short"):
+    if pattern == "short":
+        buzzer.on(); time.sleep(0.2); buzzer.off()
+    elif pattern == "long":
+        buzzer.on(); time.sleep(1); buzzer.off()
+
+def handle_event(ev):
+    print("[EVENT]", ev)
     led_set(yellow=True)
     beep("short")
-    photo, has_face = capture_image_with_face("motion")
-    event = {
-        "event": "motion_detected",
-        "face_detected": has_face,
-        "photo": photo
-    }
-    publish_to_blynk(event)
-    print("[EVENT] Motion detected:", event)
-    time.sleep(2)
+
+    telemetry = {"event": ev, "ts": datetime.utcnow().isoformat() + "Z"}
+
+    if CAMERA_ENABLED and ev.get("capture", False):
+        img = capture_image(ev["type"])
+        telemetry["image_saved"] = img
+
+    publish_to_blynk(ev)
+    publish_mqtt(telemetry)
+
+    time.sleep(0.5)
     led_set(green=True)
 
-def handle_smoke_event(state):
-    if state == 1:
-        led_set(red=True)
-        beep("long")
-        publish_to_blynk({"event": "smoke_alert", "smoke": 1})
-        print("[EVENT] Smoke detected")
-    else:
-        publish_to_blynk({"smoke": 0})
-
-def handle_dht_event():
-    try:
-        t = dht_device.temperature
-        h = dht_device.humidity
-        if t is not None and h is not None:
-            publish_to_blynk({"temperature": t, "humidity": h})
-            print(f"[DHT] Temp={t}°C Hum={h}%")
-    except RuntimeError:
-        pass
-
-# ------------------ Loops ------------------
+# ----------------- Sensor Loops -----------------
 def loop_sound():
     while True:
         if sound_sensor.value == 1:
-            handle_sound_event()
-        time.sleep(0.2)
+            event = {"type": "noise", "capture": True}
+            handle_event(event)
+            time.sleep(3)
+        time.sleep(0.1)
 
 def loop_ir():
     last = 0
     while True:
         state = ir_sensor.value
         if state and not last:
-            handle_motion_event()
+            handle_event({"type": "motion", "capture": True})
         last = state
         time.sleep(0.2)
 
 def loop_smoke():
     while True:
         state = smoke_sensor.value
-        handle_smoke_event(state)
+        if state == 1:
+            handle_event({"type": "smoke", "capture": False})
         time.sleep(3)
 
 def loop_dht():
     while True:
-        handle_dht_event()
+        try:
+            t = dht_device.temperature
+            h = dht_device.humidity
+            if t is not None and h is not None:
+                publish_mqtt({"temperature_c": t, "humidity": h})
+                if t > TEMP_THRESHOLD:
+                    handle_event({"type": "high_temp", "temp": t})
+        except RuntimeError:
+            pass
         time.sleep(10)
 
-# ------------------ Main ------------------
-if __name__ == "__main__":
-    led_set(green=True)
-    print("System running. Press Ctrl+C to exit.")
+# ----------------- Start -----------------
+threads = [
+    threading.Thread(target=loop_sound, daemon=True),
+    threading.Thread(target=loop_ir, daemon=True),
+    threading.Thread(target=loop_smoke, daemon=True),
+    threading.Thread(target=loop_dht, daemon=True)
+]
 
-    threads = [
-        threading.Thread(target=loop_sound, daemon=True),
-        threading.Thread(target=loop_ir, daemon=True),
-        threading.Thread(target=loop_smoke, daemon=True),
-        threading.Thread(target=loop_dht, daemon=True),
-    ]
-    for t in threads:
-        t.start()
+for t in threads: 
+    t.start()
 
-    try:
-        while True:
-            blynk.run()
-            time.sleep(0.1)
-    except KeyboardInterrupt:
-        print("Stopped by user")
-        led_set()
-        buzzer.off()
+led_set(green=True)
+print("System running. Ctrl+C to exit.")
+try:
+    while True:
+        blynk.run()
+        time.sleep(0.1)
+except KeyboardInterrupt:
+    client.loop_stop()
+    print("Stopped.")
+
