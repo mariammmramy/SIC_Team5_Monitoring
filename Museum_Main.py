@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 Smart Public Area Safety Node - Raspberry Pi 4
-Sensors: Mic, IR sensor, Smoke sensor (digital), DHT11
+Sensors: Mic, IR sensor (digital), Smoke sensor (digital), DHT11
 Actions: LEDs, Buzzer, Camera capture
-Connection: MQTT to ThingsBoard
+Connection: MQTT (ThingsBoard)
 """
 
 import time
@@ -15,51 +15,70 @@ import base64
 from datetime import datetime
 
 import paho.mqtt.client as mqtt
-import RPi.GPIO as GPIO
-import Adafruit_DHT
+from gpiozero import LED, Buzzer, DigitalInputDevice
 import sounddevice as sd
 import numpy as np
 import cv2
+import board
+import adafruit_dht
 
-# load config
-import importlib
-cfg = importlib.import_module("config")
+# ----------------- Config -----------------
+MQTT_BROKER = "demo.thingsboard.io"
+MQTT_PORT = 1883
+MQTT_USERNAME = "YOUR_THINGSBOARD_DEVICE_TOKEN"
+MQTT_PASSWORD = ""
+TELEMETRY_TOPIC = "v1/devices/me/telemetry"
 
-# ----------------- GPIO setup -----------------
-GPIO.setmode(GPIO.BCM)
-GPIO.setup(cfg.PIN_IR, GPIO.IN)
-GPIO.setup(cfg.PIN_SMOKE, GPIO.IN)
-GPIO.setup(cfg.PIN_BUZZER, GPIO.OUT)
-GPIO.setup(cfg.PIN_LED_GREEN, GPIO.OUT)
-GPIO.setup(cfg.PIN_LED_YELLOW, GPIO.OUT)
-GPIO.setup(cfg.PIN_LED_RED, GPIO.OUT)
+AUDIO_SAMPLE_RATE = 16000
+AUDIO_BLOCK_MS = 200
+SOUND_DB_THRESHOLD = 70.0
 
-buzzer_pwm = GPIO.PWM(cfg.PIN_BUZZER, 1000)
-buzzer_pwm.start(0)
+CAMERA_ENABLED = True
+CAMERA_RESOLUTION = (640, 480)
+TEMP_THRESHOLD = 60.0
+
+# GPIO pins
+PIN_DHT11 = board.D4
+PIN_IR = 17
+PIN_SMOKE = 22
+PIN_BUZZER = 27
+PIN_LED_GREEN = 5
+PIN_LED_YELLOW = 6
+PIN_LED_RED = 13
+
+# ----------------- GPIOZero setup -----------------
+buzzer = Buzzer(PIN_BUZZER)
+led_green = LED(PIN_LED_GREEN)
+led_yellow = LED(PIN_LED_YELLOW)
+led_red = LED(PIN_LED_RED)
+ir_sensor = DigitalInputDevice(PIN_IR, pull_up=False)
+smoke_sensor = DigitalInputDevice(PIN_SMOKE, pull_up=False)
+
+dht_device = adafruit_dht.DHT11(PIN_DHT11)
 
 def led_set(green=False, yellow=False, red=False):
-    GPIO.output(cfg.PIN_LED_GREEN, green)
-    GPIO.output(cfg.PIN_LED_YELLOW, yellow)
-    GPIO.output(cfg.PIN_LED_RED, red)
+    led_green.value = 1 if green else 0
+    led_yellow.value = 1 if yellow else 0
+    led_red.value = 1 if red else 0
 
 # ----------------- MQTT -----------------
 client = mqtt.Client()
-client.username_pw_set(cfg.MQTT_USERNAME, cfg.MQTT_PASSWORD)
-client.connect(cfg.MQTT_BROKER, cfg.MQTT_PORT, 60)
+client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+client.connect(MQTT_BROKER, MQTT_PORT, 60)
 client.loop_start()
 
 def publish_telemetry(data: dict):
     try:
         payload = json.dumps(data)
-        client.publish(cfg.TELEMETRY_TOPIC, payload)
+        client.publish(TELEMETRY_TOPIC, payload)
     except Exception as e:
         print("MQTT error:", e)
 
 # ----------------- Camera -----------------
-if cfg.CAMERA_ENABLED:
+if CAMERA_ENABLED:
     from picamera import PiCamera
     camera = PiCamera()
-    camera.resolution = cfg.CAMERA_RESOLUTION
+    camera.resolution = CAMERA_RESOLUTION
     time.sleep(1)
 
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades +
@@ -86,32 +105,25 @@ def rms_db(samples):
     return 20 * np.log10(rms)
 
 def sample_audio_block():
-    frames = int(cfg.AUDIO_SAMPLE_RATE * (cfg.AUDIO_BLOCK_MS / 1000.0))
+    frames = int(AUDIO_SAMPLE_RATE * (AUDIO_BLOCK_MS / 1000.0))
     try:
-        data = sd.rec(frames=frames, samplerate=cfg.AUDIO_SAMPLE_RATE,
+        data = sd.rec(frames=frames, samplerate=AUDIO_SAMPLE_RATE,
                       channels=1, dtype="float32")
         sd.wait()
         samples = np.squeeze(data)
-        return rms_db(samples) + 90  # calibrated offset
+        return rms_db(samples) + 90  # calibration offset
     except Exception as e:
         print("Audio error:", e)
         return 0
-
-# ----------------- DHT11 -----------------
-def read_dht11():
-    h, t = Adafruit_DHT.read_retry(Adafruit_DHT.DHT11, cfg.PIN_DHT11)
-    return t, h
 
 # ----------------- Event handling -----------------
 event_queue = queue.Queue()
 
 def beep(pattern="short"):
     if pattern == "short":
-        buzzer_pwm.ChangeDutyCycle(50); time.sleep(0.2)
-        buzzer_pwm.ChangeDutyCycle(0)
+        buzzer.on(); time.sleep(0.2); buzzer.off()
     elif pattern == "long":
-        buzzer_pwm.ChangeDutyCycle(50); time.sleep(1)
-        buzzer_pwm.ChangeDutyCycle(0)
+        buzzer.on(); time.sleep(1); buzzer.off()
 
 def handle_event(ev):
     print("EVENT:", ev)
@@ -120,7 +132,7 @@ def handle_event(ev):
 
     telemetry = {"event": ev, "ts": datetime.utcnow().isoformat() + "Z"}
 
-    if cfg.CAMERA_ENABLED and ev.get("capture", False):
+    if CAMERA_ENABLED and ev.get("capture", False):
         img, has_face = capture_image(ev["type"])
         telemetry["image_saved"] = img
         telemetry["image_has_face"] = has_face
@@ -136,8 +148,8 @@ def handle_event(ev):
 def loop_sound():
     while True:
         db = sample_audio_block()
-        if db >= cfg.SOUND_DB_THRESHOLD:
-            if GPIO.input(cfg.PIN_IR) == GPIO.HIGH:  # object present
+        if db >= SOUND_DB_THRESHOLD:
+            if ir_sensor.value:  # object present
                 event_queue.put({"type": "noise", "db": db, "capture": True})
             else:
                 event_queue.put({"type": "noise", "db": db, "capture": False})
@@ -146,7 +158,7 @@ def loop_sound():
 def loop_ir():
     last = 0
     while True:
-        state = GPIO.input(cfg.PIN_IR)
+        state = ir_sensor.value
         if state and not last:
             event_queue.put({"type": "motion", "capture": True})
         last = state
@@ -154,7 +166,7 @@ def loop_ir():
 
 def loop_smoke():
     while True:
-        state = GPIO.input(cfg.PIN_SMOKE)
+        state = smoke_sensor.value
         publish_telemetry({"smoke": int(state)})
         if state == 1:
             event_queue.put({"type": "smoke", "capture": False})
@@ -162,11 +174,15 @@ def loop_smoke():
 
 def loop_dht():
     while True:
-        t, h = read_dht11()
-        if t is not None:
-            publish_telemetry({"temperature_c": t, "humidity": h})
-            if t > cfg.TEMP_THRESHOLD:
-                event_queue.put({"type": "high_temp", "temp": t})
+        try:
+            t = dht_device.temperature
+            h = dht_device.humidity
+            if t is not None and h is not None:
+                publish_telemetry({"temperature_c": t, "humidity": h})
+                if t > TEMP_THRESHOLD:
+                    event_queue.put({"type": "high_temp", "temp": t})
+        except RuntimeError:
+            pass  # DHT sometimes fails, just retry
         time.sleep(10)
 
 def dispatcher():
@@ -192,6 +208,6 @@ try:
     while True:
         time.sleep(1)
 except KeyboardInterrupt:
-    GPIO.cleanup()
     client.loop_stop()
     print("Stopped.")
+
