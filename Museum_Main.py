@@ -9,6 +9,14 @@ Connection: Blynk IoT (new library) + HiveMQ MQTT
 import time, threading, os, subprocess, json, ssl
 from datetime import datetime
 import BlynkLib
+import time
+import threading
+import json
+import os
+import queue
+import base64
+from datetime import datetime, timezone
+
 import paho.mqtt.client as mqtt
 from gpiozero import LED, Buzzer, DigitalInputDevice
 import board, adafruit_dht
@@ -38,7 +46,8 @@ MQTT_USERNAME = "Nada131"
 MQTT_PASSWORD = "Sic1122004"
 
 CAMERA_ENABLED = True
-TEMP_THRESHOLD = 60.0
+CAMERA_RESOLUTION = (640, 480)
+TEMP_THRESHOLD = 50.0  #if fire occured
 
 # GPIO pins
 PIN_DHT11 = board.D4
