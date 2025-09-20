@@ -12,7 +12,7 @@ import json
 import os
 import queue
 import base64
-from datetime import datetime
+from datetime import datetime, timezone
 
 import paho.mqtt.client as mqtt
 from gpiozero import LED, Buzzer, DigitalInputDevice
@@ -35,12 +35,12 @@ SOUND_DB_THRESHOLD = 70.0
 
 CAMERA_ENABLED = True
 CAMERA_RESOLUTION = (640, 480)
-TEMP_THRESHOLD = 60.0
+TEMP_THRESHOLD = 50.0  #if fire occured
 
 # GPIO pins
 PIN_DHT11 = board.D4
 PIN_IR = 17
-PIN_SMOKE = 22
+PIN_SMOKE = 16
 PIN_BUZZER = 27
 PIN_LED_GREEN = 5
 PIN_LED_YELLOW = 6
@@ -82,10 +82,10 @@ if CAMERA_ENABLED:
     time.sleep(1)
 
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades +
-                                     "haarcascade_frontalface_default.xml")
+                                     "haarcascade_frontalface_default.xml") #face detection function
 
 def capture_image(tag="event"):
-    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     os.makedirs("captures", exist_ok=True)
     filename = f"captures/{tag}_{ts}.jpg"
     camera.capture(filename)
